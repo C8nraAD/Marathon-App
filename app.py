@@ -3,8 +3,7 @@ import io
 import re
 import json
 import math
-import unicodedata  # POPRAWKA: Poprawna nazwa modułu
-
+import unicodedata  
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
@@ -20,9 +19,6 @@ st.set_page_config(page_title="Kalkulator Półmaratonu", layout="wide")
 st.markdown("<h1>🏆 Kalkulator Półmaratonu</h1>", unsafe_allow_html=True)
 st.caption("Sprawdź swój czas na tle innych biegaczy — biegniemy po sukces!")
 
-# =========================
-#  ENV (tylko z .env, bez stałych w kodzie)
-# =========================
 load_dotenv()
 
 def _env(name: str) -> str | None:
@@ -32,16 +28,15 @@ def _env(name: str) -> str | None:
         return None
     return v.strip().strip("\"'")
 
-# Dane wrażliwe (klucze, endpointy) są ładowane z .env i nie są widoczne w kodzie
+
 AWS_ACCESS_KEY_ID     = _env("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = _env("AWS_SECRET_ACCESS_KEY")
-AWS_ENDPOINT_URL_S3   = _env("AWS_ENDPOINT_URL_S3")  # np. https://fra1.digitaloceanspaces.com
-DO_SPACE_NAME         = _env("DO_SPACE_NAME")        # np. marathon1
+AWS_ENDPOINT_URL_S3   = _env("AWS_ENDPOINT_URL_S3")  
+DO_SPACE_NAME         = _env("DO_SPACE_NAME")       
 
-S3_FILE_2023 = _env("S3_FILE_2023")  # np. raw/2023_TRAIN.csv
-S3_FILE_2024 = _env("S3_FILE_2024")  # np. raw/2024_TEST.csv
-MODEL_S3_KEY = _env("MODEL_S3_KEY")  # np. raw/final_halfmarathon_model_pipeline.joblib
-
+S3_FILE_2023 = _env("S3_FILE_2023")  
+S3_FILE_2024 = _env("S3_FILE_2024")  
+MODEL_S3_KEY = _env("MODEL_S3_KEY")  
 OPENAI_API_KEY = _env("OPENAI_API_KEY")
 if OPENAI_API_KEY:
     os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
@@ -54,10 +49,7 @@ def s3_client():
         aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
     )
 
-# =========================
-#  FUNKCJE POMOCNICZE (DEFINICJA PRZED UŻYCIEM)
-# =========================
-
+#  FUNKCJE POMOCNICZE 
 def seconds_to_hhmmss(sec: float) -> str:
     try:
         sec = int(round(float(sec)))
@@ -82,7 +74,6 @@ def pace_label_from_total(total_sec: float) -> str:
 def speed_kmh(total_sec: float) -> float:
     return 0.0 if total_sec <= 0 else 21.0975 / (total_sec/3600.0)
 
-# POPRAWKA KOLEJNOŚCI: Ta funkcja jest teraz zdefiniowana PRZED 'load_race_data_from_spaces'
 def age_to_group(age: int) -> str:
     if age < 20: return "<20"
     if age < 30: return "20–29"
@@ -175,9 +166,8 @@ def val_time1k(x):
     sec = time_to_seconds(t)
     return t if sec and 150 <= sec <= 720 else None
 
-# =========================
-#  ŁADOWANIE DANYCH Z SPACES (@st.cache_data)
-# =========================
+
+# @st.cache_data
 @st.cache_data
 def load_race_data_from_spaces():
     missing = [k for k, v in {
@@ -220,10 +210,10 @@ def load_race_data_from_spaces():
     # sanity
     df_valid = df[(df["Wiek"].between(15, 90)) & df["Czas_Sekundy"].notna()].copy()
 
-    # grupy (TERAZ ZADZIAŁA, bo age_to_group jest zdefiniowane wyżej)
+    # grupy 
     df_valid["Grupa"] = df_valid["Wiek"].astype(int).apply(age_to_group)
 
-    # percentyle (używamy median jako benchmark)
+    # percentyle 
     q = df_valid.groupby("Grupa")["Czas_Sekundy"].quantile([0.25, 0.5, 0.75]).unstack()
     age_bench = {
         g: {"p25": float(q.loc[g, 0.25]), "median": float(q.loc[g, 0.50]), "p75": float(q.loc[g, 0.75])}
@@ -246,19 +236,15 @@ def load_race_data_from_spaces():
 # Uruchomienie ładowania danych
 RAW_ALL, POP_VALID, AGE_BENCHMARKS, STAB_BY_GROUP, MED_TIME_BY_GROUP, OVERALL_MEDIAN = load_race_data_from_spaces()
 
-# =========================
 #  PROFIL TEMPA (ZALEŻNY OD DANYCH)
-# =========================
-# Ta funkcja musi być zdefiniowana PO 'load_race_data_from_spaces', 
-# ponieważ używa globalnej zmiennej 'STAB_BY_GROUP'
 def data_driven_pace_profile(total_sec: float, group: str) -> pd.DataFrame:
     km_total = 21.0975
     km_marks = np.array(list(range(0, 22)) + [21.0975], dtype=float)
     x = km_marks / km_total
     stability = float(STAB_BY_GROUP.get(group, 0.045))
     
-    # UWAGA (Senior): Poniższe stałe (0.85, 5.5, 0.12, 0.10...)
-    # zostały wyznaczone empirycznie podczas analizy profili tempa (np. w notatniku).
+    
+    #
     amp   = np.clip(0.85 + 5.5*stability, 0.85, 1.25)
     fade  = np.clip(1.015 + 5.0*stability, 1.015, 1.10)
     shape = 1.0 - 0.02*amp*np.exp(-((x-0.12)/0.10)**2) + (fade-1.0)*np.clip((x-0.72)/0.28, 0, 1)**2
@@ -269,9 +255,9 @@ def data_driven_pace_profile(total_sec: float, group: str) -> pd.DataFrame:
     pace_per_km = C * shape_r
     return pd.DataFrame({"km": km_marks[1:], "tempo_s_na_km": pace_per_km})
 
-# =========================
+
 #  MODEL (@st.cache_resource)
-# =========================
+
 @st.cache_resource
 def load_model_from_spaces():
     if not MODEL_S3_KEY:
@@ -287,9 +273,9 @@ def load_model_from_spaces():
 model = load_model_from_spaces()
 MODEL_READY = model is not None
 
-# =========================
-#  LLM (OpenAI + Langfuse) – podstawowy monitoring
-# =========================
+
+#  LLM
+
 try:
     llm_client: LfOpenAI | None = LfOpenAI() if OPENAI_API_KEY else None
     LLM_READY = llm_client is not None
@@ -363,9 +349,7 @@ Nie powtarzaj liczb zbyt często – wystarczy raz na początku.
         st.warning(f"Nie udało się pobrać wyjaśnienia od modelu LLM: {e}")
         return None
 
-# =========================
 #  SESSION STATE
-# =========================
 if "messages" not in st.session_state:
     st.session_state["messages"]=[]
 if "answers"  not in st.session_state:
@@ -377,10 +361,7 @@ if "last_prediction" not in st.session_state:
 if "show_balloons" not in st.session_state:
     st.session_state["show_balloons"] = False
 
-# =========================
 #  LOGIKA CZATU (FSM)
-# =========================
-
 def current_prompt():
     i = st.session_state["step_index"]
     prompts = [
@@ -449,7 +430,7 @@ def chatbot_reply(user_prompt: str, memory: list[dict]) -> dict:
                 km_pace = czas_5km/5
                 total_sec = km_pace*21.0975
 
-            # zapis wyniku do state
+
             st.session_state["last_prediction"] = {
                 "name": name,
                 "plec": plec,
@@ -460,10 +441,9 @@ def chatbot_reply(user_prompt: str, memory: list[dict]) -> dict:
                 "prediction_str": seconds_to_hhmmss(total_sec),
             }
 
-            # ustaw flagę balonów – odpala się po rerunie, gdy karta jest już narysowana
+          
             st.session_state["show_balloons"] = True
 
-            # karta „Predykcja i skala” jako odpowiedź w czacie
             card_html = f"""
 <div class="result-card">
   <div class="result-header">📊 Predykcja i skala</div>
@@ -507,12 +487,9 @@ with st.sidebar:
         st.session_state["show_balloons"] = False
         st.rerun()
 
-# =========================
-#  LAYOUT (CHAT + ANALIZA)
-# =========================
 left, right = st.columns([0.55, 0.45], vertical_alignment="top")
 
-# --- LEWA: chat (bez nagłówka "Chat"), z separatorami
+
 with left:
     if not st.session_state["messages"]:
         st.session_state["messages"].append({
@@ -528,7 +505,7 @@ with left:
         if idx < len(st.session_state["messages"]) - 1:
             st.markdown("<div class='msg-sep'></div>", unsafe_allow_html=True)
 
-# --- PRAWA: analiza, wykresy, splity, zapis
+
 with right:
     st.subheader("📈 Analiza porównawcza")
     d = st.session_state.get("last_prediction")
@@ -536,12 +513,11 @@ with right:
         st.info("Wypełnij 4 kroki w czacie — po predykcji pojawią się wykresy i analiza.")
     else:
         total_sec = float(d["prediction_sec"])
-        user_group = age_to_group(int(d["wiek"])) # Ta funkcja jest już znana
+        user_group = age_to_group(int(d["wiek"])) 
 
-        # === POCZĄTEK ZMIANY: Definicja spójnych kolorów ===
-        USER_COLOR = "#FF6347"  # Jasny, pomarańczowo-czerwony (Tomato)
-        REST_COLOR = "#A9A9A9"  # Ciemniejszy szary (DarkGray)
-        # === KONIEC ZMIANY ===
+        USER_COLOR = "#FF6347"  
+        REST_COLOR = "#A9A9A9"  
+
 
         # Wykres 1: stałe progi + Twój czas
         ref_categories = ["Twój czas", "Top 5%", "Top 15%", "Rekreacyjni", "Początkujący"]
@@ -567,7 +543,7 @@ with right:
         )
         st.altair_chart(bar1, use_container_width=True)
 
-        # Wykres 2: 3 kolumny — Twój czas | Mediana wszystkich | Mediana grupy
+        # Wykres 2
         med_all = OVERALL_MEDIAN
         med_grp = float(AGE_BENCHMARKS[user_group]["median"])
         
@@ -597,7 +573,6 @@ with right:
 
         # Czasy pośrednie
         st.markdown("#### ⏱️ Czasy pośrednie")
-        # data_driven_pace_profile jest już znana
         pace_user = data_driven_pace_profile(total_sec, user_group).rename(columns={"tempo_s_na_km":"Tempo [s/km]"})
         km_points = pace_user["km"].to_numpy()
         tempo_k   = pace_user["Tempo [s/km]"].to_numpy()
@@ -649,7 +624,7 @@ with right:
             use_container_width=True
         )
 
-        # 🔍 DODANE: Wyjaśnienie od modelu OpenAI monitorowane w Langfuse
+        # 🔍 
         if LLM_READY:
             st.markdown("#### 🧠 Wyjaśnienie od modelu GPT (monitorowane w Langfuse)")
             with st.expander("Pokaż wyjaśnienie modelu LLM"):
@@ -667,9 +642,8 @@ with right:
         else:
             st.caption("LLM (OpenAI + Langfuse) nieaktywne – brak OPENAI_API_KEY lub problem z inicjalizacją klienta.")
 
-# =========================
+
 #  Chat input (fixed bottom)
-# =========================
 prompt = st.chat_input("Napisz odpowiedź…")
 if prompt:
     st.session_state["messages"].append({"role":"user","content":prompt})
@@ -684,14 +658,12 @@ if prompt:
     })
     st.rerun()
 
-# 🎈 Balony – dokładnie wtedy, gdy wyświetliła się karta „Predykcja i skala”
+# 🎈 Balony 
 if st.session_state.get("show_balloons"):
     st.balloons()
     st.session_state["show_balloons"] = False
 
-# =========================
-#  Styl + JS (chat_input na dole, autoscroll, separatory)
-# =========================
+#  Styl + JS 
 BOTTOM_BAR_HEIGHT = 74
 st.markdown(f"""
 <style>
