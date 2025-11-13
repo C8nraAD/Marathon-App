@@ -3,8 +3,7 @@ import io
 import re
 import json
 import math
-import unicodedata  # POPRAWKA: Poprawna nazwa modułu
-
+import unicodedata
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
@@ -13,9 +12,12 @@ import altair as alt
 import boto3
 import joblib
 from dotenv import load_dotenv
-from langfuse.openai import OpenAI as LfOpenAI
+from langfuse import Langfuse  # DODANE
+from langfuse.model import CreateTrace, CreateSpan, UpdateSpan  # DODANE
 
+# =========================
 #  STRONA
+# =========================
 st.set_page_config(page_title="Kalkulator Półmaratonu", layout="wide")
 st.markdown("<h1>🏆 Kalkulator Półmaratonu</h1>", unsafe_allow_html=True)
 st.caption("Sprawdź swój czas na tle innych biegaczy — biegniemy po sukces!")
@@ -25,6 +27,7 @@ st.caption("Sprawdź swój czas na tle innych biegaczy — biegniemy po sukces!"
 # =========================
 load_dotenv()
 
+
 def _env(name: str) -> str | None:
     """Pobierz zmienną z .env i obetnij ewentualne cudzysłowy/spacje."""
     v = os.getenv(name)
@@ -32,19 +35,23 @@ def _env(name: str) -> str | None:
         return None
     return v.strip().strip("\"'")
 
+
 # Dane wrażliwe (klucze, endpointy) są ładowane z .env i nie są widoczne w kodzie
-AWS_ACCESS_KEY_ID     = _env("AWS_ACCESS_KEY_ID")
+AWS_ACCESS_KEY_ID = _env("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = _env("AWS_SECRET_ACCESS_KEY")
-AWS_ENDPOINT_URL_S3   = _env("AWS_ENDPOINT_URL_S3")  # np. https://fra1.digitaloceanspaces.com
-DO_SPACE_NAME         = _env("DO_SPACE_NAME")        # np. marathon1
+AWS_ENDPOINT_URL_S3 = _env("AWS_ENDPOINT_URL_S3")  # np. https://fra1.digitaloceanspaces.com
+DO_SPACE_NAME = _env("DO_SPACE_NAME")  # np. marathon1
 
 S3_FILE_2023 = _env("S3_FILE_2023")  # np. raw/2023_TRAIN.csv
 S3_FILE_2024 = _env("S3_FILE_2024")  # np. raw/2024_TEST.csv
 MODEL_S3_KEY = _env("MODEL_S3_KEY")  # np. raw/final_halfmarathon_model_pipeline.joblib
 
-OPENAI_API_KEY = _env("OPENAI_API_KEY")
-if OPENAI_API_KEY:
-    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+# === DODANE: ZMIENNE LANGFUSE ===
+LANGFUSE_PUBLIC_KEY = _env("LANGFUSE_PUBLIC_KEY")
+LANGFUSE_SECRET_KEY = _env("LANGFUSE_SECRET_KEY")
+LANGFUSE_HOST = _env("LANGFUSE_HOST")  # np. https://cloud.langfuse.com
+# === KONIEC DODANIA ===
+
 
 def s3_client():
     return boto3.client(
@@ -53,6 +60,35 @@ def s3_client():
         aws_access_key_id=AWS_ACCESS_KEY_ID,
         aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
     )
+
+
+# === DODANE: KLIENT LANGFUSE ===
+@st.cache_resource
+def get_langfuse_client():
+    """Inicjalizuje klienta Langfuse (cache'owane w Streamlit)."""
+    if not LANGFUSE_PUBLIC_KEY or not LANGFUSE_SECRET_KEY or not LANGFUSE_HOST:
+        # Cicha dezaktywacja, jeśli brak kluczy w .env
+        return None
+    try:
+        client = Langfuse(
+            public_key=LANGFUSE_PUBLIC_KEY,
+            secret_key=LANGFUSE_SECRET_KEY,
+            host=LANGFUSE_HOST,
+            release="halfmarathon-calc-v1.1",  # Dobra praktyka: wersjonowanie
+            flush_at=1,  # Ważne dla Streamlit: wysyłaj dane natychmiast
+            flush_interval=0.1
+        )
+        return client
+    except Exception as e:
+        st.error(f"Błąd inicjalizacji Langfuse: {e}")
+        return None
+
+
+langfuse_client = get_langfuse_client()
+
+
+# === KONIEC DODANIA ===
+
 
 # =========================
 #  FUNKCJE POMOCNICZE (DEFINICJA PRZED UŻYCIEM)
@@ -67,22 +103,25 @@ def seconds_to_hhmmss(sec: float) -> str:
     except Exception:
         return "Błąd"
 
+
 def time_to_seconds(ms: str) -> int | None:
     try:
         m, s = map(int, ms.split(":"))
-        return m*60 + s
+        return m * 60 + s
     except Exception:
         return None
+
 
 def pace_label_from_total(total_sec: float) -> str:
     pace_sec = math.ceil(total_sec / 21.0975)
     mm, ss = divmod(pace_sec, 60)
     return f"{mm}:{ss:02d} / km"
 
-def speed_kmh(total_sec: float) -> float:
-    return 0.0 if total_sec <= 0 else 21.0975 / (total_sec/3600.0)
 
-# POPRAWKA KOLEJNOŚCI: Ta funkcja jest teraz zdefiniowana PRZED 'load_race_data_from_spaces'
+def speed_kmh(total_sec: float) -> float:
+    return 0.0 if total_sec <= 0 else 21.0975 / (total_sec / 3600.0)
+
+
 def age_to_group(age: int) -> str:
     if age < 20: return "<20"
     if age < 30: return "20–29"
@@ -91,27 +130,32 @@ def age_to_group(age: int) -> str:
     if age < 60: return "50–59"
     return "60+"
 
+
 BANDS = [
-    (90*60,   "Elita / 1:30↓"),
-    (105*60,  "Bardzo dobry"),
-    (120*60,  "Dobry (Sub-2:00)"),
-    (135*60,  "Rekreacyjny+"),
-    (999*60,  "Początkujący / 2:15+"),
+    (90 * 60, "Elita / 1:30↓"),
+    (105 * 60, "Bardzo dobry"),
+    (120 * 60, "Dobry (Sub-2:00)"),
+    (135 * 60, "Rekreacyjny+"),
+    (999 * 60, "Początkujący / 2:15+"),
 ]
+
+
 def classify_result(total_sec: float) -> str:
     for thr, lab in BANDS:
         if total_sec <= thr:
             return lab
     return "—"
 
+
 def _norm(s: str) -> str:
     if s is None:
         return ""
     s = s.strip().lower()
     s = "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
-    return re.sub(r"\s+"," ", s)
+    return re.sub(r"\s+", " ", s)
 
-def parse_name(text: str) -> str|None:
+
+def parse_name(text: str) -> str | None:
     if not text:
         return None
     raw = text.strip()
@@ -123,21 +167,23 @@ def parse_name(text: str) -> str|None:
     t = raw.split()[0]
     return t if re.fullmatch(r"[A-Za-zÀ-ÖØ-öø-ÿ\-]+", t) and len(t) >= 2 else None
 
-def parse_gender(text: str) -> str|None:
+
+def parse_gender(text: str) -> str | None:
     if not text:
         return None
     s = _norm(text)
-    if any(ch in text for ch in ["♀","🚺"]):
+    if any(ch in text for ch in ["♀", "🚺"]):
         return "K"
-    if any(ch in text for ch in ["♂","🚹"]):
+    if any(ch in text for ch in ["♂", "🚹"]):
         return "M"
-    if s.startswith(("k ","ko","dz","fe","wo","pa")) or s=="k":
+    if s.startswith(("k ", "ko", "dz", "fe", "wo", "pa")) or s == "k":
         return "K"
-    if s.startswith(("m ","me","ma","fa","chl","pan")) or s=="m":
+    if s.startswith(("m ", "me", "ma", "fa", "chl", "pan")) or s == "m":
         return "M"
     return None
 
-def parse_age(text: str) -> int|None:
+
+def parse_age(text: str) -> int | None:
     if not text:
         return None
     s = _norm(text)
@@ -148,10 +194,11 @@ def parse_age(text: str) -> int|None:
             return 15 <= age <= 90 and age or None
     return None
 
-def parse_time1k(text: str) -> str|None:
+
+def parse_time1k(text: str) -> str | None:
     if not text:
         return None
-    s = text.strip().lower().replace(" ","").replace(",",":").replace(";",":").replace("min","m").replace("sek","s")
+    s = text.strip().lower().replace(" ", "").replace(",", ":").replace(";", ":").replace("min", "m").replace("sek", "s")
     m = re.fullmatch(r"(\d{1,2}):(\d{1,2})", s)
     if m:
         mm, ss = map(int, m.groups())
@@ -165,15 +212,23 @@ def parse_time1k(text: str) -> str|None:
             return f"{mm}:{ss:02d}"
     return None
 
+
 def val_name(x): return parse_name(x)
+
+
 def val_gender(x): return parse_gender(x)
+
+
 def val_age(x): return parse_age(x)
+
+
 def val_time1k(x):
     t = parse_time1k(x)
     if not t:
         return None
     sec = time_to_seconds(t)
     return t if sec and 150 <= sec <= 720 else None
+
 
 # =========================
 #  ŁADOWANIE DANYCH Z SPACES (@st.cache_data)
@@ -214,13 +269,13 @@ def load_race_data_from_spaces():
             )
 
     train = _get_csv_or_explain(S3_FILE_2023)
-    test  = _get_csv_or_explain(S3_FILE_2024)
+    test = _get_csv_or_explain(S3_FILE_2024)
     df = pd.concat([train, test], ignore_index=True)
 
     # sanity
     df_valid = df[(df["Wiek"].between(15, 90)) & df["Czas_Sekundy"].notna()].copy()
 
-    # grupy (TERAZ ZADZIAŁA, bo age_to_group jest zdefiniowane wyżej)
+    # grupy
     df_valid["Grupa"] = df_valid["Wiek"].astype(int).apply(age_to_group)
 
     # percentyle (używamy median jako benchmark)
@@ -243,31 +298,30 @@ def load_race_data_from_spaces():
 
     return df, df_valid, age_bench, stab, med_by_group, overall_median
 
+
 # Uruchomienie ładowania danych
 RAW_ALL, POP_VALID, AGE_BENCHMARKS, STAB_BY_GROUP, MED_TIME_BY_GROUP, OVERALL_MEDIAN = load_race_data_from_spaces()
+
 
 # =========================
 #  PROFIL TEMPA (ZALEŻNY OD DANYCH)
 # =========================
-# Ta funkcja musi być zdefiniowana PO 'load_race_data_from_spaces', 
-# ponieważ używa globalnej zmiennej 'STAB_BY_GROUP'
 def data_driven_pace_profile(total_sec: float, group: str) -> pd.DataFrame:
     km_total = 21.0975
     km_marks = np.array(list(range(0, 22)) + [21.0975], dtype=float)
     x = km_marks / km_total
     stability = float(STAB_BY_GROUP.get(group, 0.045))
-    
-    # UWAGA (Senior): Poniższe stałe (0.85, 5.5, 0.12, 0.10...)
-    # zostały wyznaczone empirycznie podczas analizy profili tempa (np. w notatniku).
-    amp   = np.clip(0.85 + 5.5*stability, 0.85, 1.25)
-    fade  = np.clip(1.015 + 5.0*stability, 1.015, 1.10)
-    shape = 1.0 - 0.02*amp*np.exp(-((x-0.12)/0.10)**2) + (fade-1.0)*np.clip((x-0.72)/0.28, 0, 1)**2
-    
+
+    amp = np.clip(0.85 + 5.5 * stability, 0.85, 1.25)
+    fade = np.clip(1.015 + 5.0 * stability, 1.015, 1.10)
+    shape = 1.0 - 0.02 * amp * np.exp(-((x - 0.12) / 0.10) ** 2) + (fade - 1.0) * np.clip((x - 0.72) / 0.28, 0, 1) ** 2
+
     seg_len = np.diff(km_marks)
     shape_r = shape[1:]
     C = total_sec / np.sum(seg_len * shape_r)
     pace_per_km = C * shape_r
     return pd.DataFrame({"km": km_marks[1:], "tempo_s_na_km": pace_per_km})
+
 
 # =========================
 #  MODEL (@st.cache_resource)
@@ -284,98 +338,24 @@ def load_model_from_spaces():
         st.warning(f"Model z Spaces niedostępny: {e}")
         return None
 
+
 model = load_model_from_spaces()
 MODEL_READY = model is not None
-
-# =========================
-#  LLM (OpenAI + Langfuse) – podstawowy monitoring
-# =========================
-try:
-    llm_client: LfOpenAI | None = LfOpenAI() if OPENAI_API_KEY else None
-    LLM_READY = llm_client is not None
-except Exception:
-    llm_client = None
-    LLM_READY = False
-
-def explain_prediction_with_llm(
-    result: dict,
-    group: str,
-    med_all_sec: float,
-    med_group_sec: float,
-) -> str | None:
-    """
-    Proste wyjaśnienie wyniku od GPT-4o-mini.
-    Wywołanie jest monitorowane w Langfuse dzięki importowi z langfuse.openai.
-    """
-    if not (LLM_READY and llm_client):
-        return None
-
-    try:
-        total_sec = float(result["prediction_sec"])
-        pace_label = pace_label_from_total(total_sec)
-        speed = round(speed_kmh(total_sec), 2)
-
-        user_name = result.get("name") or "biegaczu"
-        plec = "kobieta" if result.get("plec") == "K" else "mężczyzna"
-        wiek = result.get("wiek")
-
-        user_time_str = seconds_to_hhmmss(total_sec)
-        med_all_str = seconds_to_hhmmss(med_all_sec)
-        med_group_str = seconds_to_hhmmss(med_group_sec)
-
-        system_msg = (
-            "Jesteś doświadczonym trenerem biegania. "
-            "Wyjaśniasz wyniki bardzo konkretnie, krótko (max 4 akapity) i po polsku. "
-            "Unikaj motywacyjnego bełkotu, skup się na faktach i rekomendacjach treningowych."
-        )
-
-        user_msg = f"""
-Imię: {user_name}
-Płeć: {plec}
-Wiek: {wiek}
-Grupa wiekowa: {group}
-
-Szacowany czas półmaratonu użytkownika: {user_time_str}
-Mediana czasu dla wszystkich biegaczy: {med_all_str}
-Mediana czasu dla grupy wiekowej {group}: {med_group_str}
-
-Średnie tempo: {pace_label}
-Średnia prędkość: {speed} km/h
-
-Napisz:
-1) Krótką interpretację – czy wynik jest poniżej, powyżej czy w okolicy mediany grupy.
-2) Co ten wynik sugeruje o aktualnym poziomie (np. amator, ambitny amator, półzawodowiec).
-3) 3–4 bardzo konkretne rekomendacje treningowe (punkty), które realnie mogą poprawić wynik o 5–10 minut.
-Nie powtarzaj liczb zbyt często – wystarczy raz na początku.
-"""
-
-        completion = llm_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            temperature=0.35,
-        )
-        # Nowy SDK: choices[0].message.content to string
-        return completion.choices[0].message.content
-    except Exception as e:
-        st.warning(f"Nie udało się pobrać wyjaśnienia od modelu LLM: {e}")
-        return None
 
 # =========================
 #  SESSION STATE
 # =========================
 if "messages" not in st.session_state:
-    st.session_state["messages"]=[]
-if "answers"  not in st.session_state:
-    st.session_state["answers"]={"name":None,"gender":None,"age":None,"time_1km_str":None}
+    st.session_state["messages"] = []
+if "answers" not in st.session_state:
+    st.session_state["answers"] = {"name": None, "gender": None, "age": None, "time_1km_str": None}
 if "step_index" not in st.session_state:
-    st.session_state["step_index"]=0
+    st.session_state["step_index"] = 0
 if "last_prediction" not in st.session_state:
-    st.session_state["last_prediction"]=None
+    st.session_state["last_prediction"] = None
 if "show_balloons" not in st.session_state:
     st.session_state["show_balloons"] = False
+
 
 # =========================
 #  LOGIKA CZATU (FSM)
@@ -395,59 +375,146 @@ def current_prompt():
         return prompts[i]
     return "Chcesz nową prognozę? Napisz „reset” lub podaj nowe imię."
 
+
+# === MODYFIKACJA: Cała funkcja `chatbot_reply` ===
 def chatbot_reply(user_prompt: str, memory: list[dict]) -> dict:
+    # === LANGFUSE: START TRACE ===
+    trace = None
+    if langfuse_client:
+        user_id = st.session_state["answers"].get("name", "unknown_user")
+        trace = langfuse_client.trace(CreateTrace(
+            name="FSM Chat Turn",
+            user_id=user_id,
+            input=user_prompt,
+            metadata={
+                "step_index": st.session_state["step_index"],
+                "current_answers": st.session_state["answers"]
+            },
+            tags=["fsm", "marathon_calc"]
+        ))
+    # === KONIEC LANGFUSE ===
+
+    def _update_trace_and_return(response_dict: dict, level: str = "DEFAULT", status_message: str | None = None) -> dict:
+        """Pomocnik do aktualizacji trace przed zwrotką."""
+        if trace:
+            trace.update(
+                output=response_dict["content"],
+                level=level,
+                status_message=status_message,
+                metadata={  # Zawsze aktualizuj stan *po* wykonaniu kroku
+                    "step_index": st.session_state["step_index"],
+                    "current_answers": st.session_state["answers"],
+                    "last_prediction": st.session_state.get("last_prediction")
+                }
+            )
+        return response_dict
+
     s = (user_prompt or "").strip().lower()
-    if s in ("reset","zacznij od nowa","restart"):
+
+    # Obsługa 'reset'
+    if s in ("reset", "zacznij od nowa", "restart"):
         st.session_state["messages"].clear()
-        st.session_state["answers"]={"name":None,"gender":None,"age":None,"time_1km_str":None}
-        st.session_state["step_index"]=0
-        st.session_state["last_prediction"]=None
+        st.session_state["answers"] = {"name": None, "gender": None, "age": None, "time_1km_str": None}
+        st.session_state["step_index"] = 0
+        st.session_state["last_prediction"] = None
         st.session_state["show_balloons"] = False
-        return {"role":"assistant","content":"Zaczynamy od nowa. "+current_prompt(),"usage":{}}
-    if s in ("cofnij","back"):
-        st.session_state["step_index"]=max(0,st.session_state["step_index"]-1)
-        return {"role":"assistant","content":"OK, wróćmy. "+current_prompt(),"usage":{}}
+
+        response = {"role": "assistant", "content": "Zaczynamy od nowa. " + current_prompt(), "usage": {}}
+        return _update_trace_and_return(response)  # ZWROTKA 1
+
+    # Obsługa 'cofnij'
+    if s in ("cofnij", "back"):
+        st.session_state["step_index"] = max(0, st.session_state["step_index"] - 1)
+
+        response = {"role": "assistant", "content": "OK, wróćmy. " + current_prompt(), "usage": {}}
+        return _update_trace_and_return(response)  # ZWROTKA 2
 
     steps = [
-        {"key":"name","validator":val_name,"error":"Podaj imię. Np. 'Jestem Ania' albo po prostu 'Ania'."},
-        {"key":"gender","validator":val_gender,"error":"Wpisz płeć: np. 'M', 'mężczyzna', 'kobieta', 'K'."},
-        {"key":"age","validator":val_age,"error":"Podaj wiek (15–90). Np. '27', '27 lat', '29yo'."},
-        {"key":"time_1km_str","validator":val_time1k,"error":"Podaj czas 1 km. Np. '4:30', '430', '5' (czyli 5:00)."},
+        {"key": "name", "validator": val_name, "error": "Podaj imię. Np. 'Jestem Ania' albo po prostu 'Ania'."},
+        {"key": "gender", "validator": val_gender, "error": "Wpisz płeć: np. 'M', 'mężczyzna', 'kobieta', 'K'."},
+        {"key": "age", "validator": val_age, "error": "Podaj wiek (15–90). Np. '27', '27 lat', '29yo'."},
+        {"key": "time_1km_str", "validator": val_time1k,
+         "error": "Podaj czas 1 km. Np. '4:30', '430', '5' (czyli 5:00)."},
     ]
     i = st.session_state["step_index"]
+
     if i < len(steps):
-        step=steps[i]
-        val=step["validator"](user_prompt)
+        step = steps[i]
+
+        # === LANGFUSE: SPAN (Walidacja) ===
+        span = None
+        if trace:
+            span = trace.span(CreateSpan(
+                name=f"Validation Step: {step['key']}",
+                input={"user_prompt": user_prompt},
+                metadata={"step_key": step['key']}
+            ))
+
+        val = step["validator"](user_prompt)
+
         if val is None:
-            return {"role":"assistant","content":f"{step['error']}\n\n{current_prompt()}","usage":{}}
-        st.session_state["answers"][step["key"]]=val
-        st.session_state["step_index"]+=1
-        if st.session_state["step_index"]<len(steps):
-            return {"role":"assistant","content":current_prompt(),"usage":{}}
+            # Walidacja nieudana
+            if span:
+                span.update(UpdateSpan(
+                    output={"valid": False, "parsed_value": None},
+                    level="WARNING",
+                    status_message="Validation Failed"
+                ))
+            response = {"role": "assistant", "content": f"{step['error']}\n\n{current_prompt()}", "usage": {}}
+            return _update_trace_and_return(response, level="WARNING",
+                                            status_message="User input validation failed")  # ZWROTKA 3
+
+        # Walidacja udana
+        if span:
+            span.update(UpdateSpan(
+                output={"valid": True, "parsed_value": val},
+                level="DEFAULT"
+            ))
+
+        st.session_state["answers"][step["key"]] = val
+        st.session_state["step_index"] += 1
+
+        if st.session_state["step_index"] < len(steps):
+            response = {"role": "assistant", "content": current_prompt(), "usage": {}}
+            return _update_trace_and_return(response)  # ZWROTKA 4 (Następny krok)
 
     # komplet → predykcja
     a = st.session_state["answers"]
-    if all(a[k] is not None for k in ("name","gender","age","time_1km_str")):
-        name=a["name"]; plec=a["gender"]; wiek=int(a["age"]); t1=a["time_1km_str"]
-        st.session_state["answers"]={"name":None,"gender":None,"age":None,"time_1km_str":None}
-        st.session_state["step_index"]=0
+    if all(a[k] is not None for k in ("name", "gender", "age", "time_1km_str")):
+
+        # === LANGFUSE: SPAN (Predykcja) ===
+        pred_span = None
+        if trace:
+            pred_span = trace.span(CreateSpan(
+                name="Model Prediction",
+                input=a,  # Logujemy zebrane odpowiedzi jako input
+                metadata={"model_ready": MODEL_READY}
+            ))
 
         try:
-            czas_5km = time_to_seconds(t1)*5
-            plec_enc = 1 if plec=="K" else 0
+            name = a["name"];
+            plec = a["gender"];
+            wiek = int(a["age"]);
+            t1 = a["time_1km_str"]
+            st.session_state["answers"] = {"name": None, "gender": None, "age": None, "time_1km_str": None}
+            st.session_state["step_index"] = 0
+
+            czas_5km = time_to_seconds(t1) * 5
+            plec_enc = 1 if plec == "K" else 0
+
             if MODEL_READY:
                 feats = pd.DataFrame({
-                    "20_km_Czas_Sekundy":[(czas_5km/5)*20],
-                    "15_km_Czas_Sekundy":[(czas_5km/5)*15],
-                    "10_km_Czas_Sekundy":[(czas_5km/5)*10],
-                    "5_km_Czas_Sekundy":[czas_5km],
-                    "Wiek":[wiek],
-                    "Płeć_Encoded":[plec_enc],
+                    "20_km_Czas_Sekundy": [(czas_5km / 5) * 20],
+                    "15_km_Czas_Sekundy": [(czas_5km / 5) * 15],
+                    "10_km_Czas_Sekundy": [(czas_5km / 5) * 10],
+                    "5_km_Czas_Sekundy": [czas_5km],
+                    "Wiek": [wiek],
+                    "Płeć_Encoded": [plec_enc],
                 })
                 total_sec = float(model.predict(feats)[0])
             else:
-                km_pace = czas_5km/5
-                total_sec = km_pace*21.0975
+                km_pace = czas_5km / 5
+                total_sec = km_pace * 21.0975
 
             # zapis wyniku do state
             st.session_state["last_prediction"] = {
@@ -459,23 +526,43 @@ def chatbot_reply(user_prompt: str, memory: list[dict]) -> dict:
                 "prediction_sec": int(round(total_sec)),
                 "prediction_str": seconds_to_hhmmss(total_sec),
             }
-
-            # ustaw flagę balonów – odpala się po rerunie, gdy karta jest już narysowana
             st.session_state["show_balloons"] = True
 
-            # karta „Predykcja i skala” jako odpowiedź w czacie
+            # Aktualizacja span (sukces)
+            if pred_span:
+                pred_span.update(UpdateSpan(
+                    output={"prediction_sec": total_sec},
+                    level="DEFAULT"
+                ))
+
+            # karta „Predykcja i skala”
             card_html = f"""
 <div class="result-card">
   <div class="result-header">📊 Predykcja i skala</div>
   <div class="result-row ok">✅ Szacowany czas półmaratonu: <b>{seconds_to_hhmmss(total_sec)}</b> — dokładność orientacyjna <b>±5 minut</b>.</div>
-  <div class="result-row band">📎 Dane: wiek <b>{wiek}</b>, płeć <b>{'K' if plec=='K' else 'M'}</b>, 1 km <b>{t1}</b></div>
+  <div class="result-row band">📎 Dane: wiek <b>{wiek}</b>, płeć <b>{'K' if plec == 'K' else 'M'}</b>, 1 km <b>{t1}</b></div>
 </div>
 """
-            return {"role":"assistant","content":card_html,"usage":{}}
-        except Exception as e:
-            return {"role":"assistant","content":f"Nie udało się policzyć: {e}\nSpróbuj ponownie. "+current_prompt(),"usage":{}}
+            response = {"role": "assistant", "content": card_html, "usage": {}}
+            return _update_trace_and_return(response)  # ZWROTKA 5 (Sukces predykcji)
 
-    return {"role":"assistant","content":current_prompt(),"usage":{}}
+        except Exception as e:
+            # Błąd predykcji
+            if pred_span:
+                pred_span.update(UpdateSpan(
+                    level="ERROR",
+                    status_message=str(e)
+                ))
+            response = {"role": "assistant", "content": f"Nie udało się policzyć: {e}\nSpróbuj ponownie. " + current_prompt(),
+                        "usage": {}}
+            return _update_trace_and_return(response, level="ERROR",
+                                            status_message=f"Prediction failed: {e}")  # ZWROTKA 6 (Błąd predykcji)
+
+    # Domyślna odpowiedź (jeśli np. ktoś pisze po zakończeniu FSM)
+    response = {"role": "assistant", "content": current_prompt(), "usage": {}}
+    return _update_trace_and_return(response)  # ZWROTKA 7 (Default)
+# === KONIEC MODYFIKACJI ===
+
 
 # =========================
 #  SIDEBAR
@@ -493,7 +580,8 @@ with st.sidebar:
     st.markdown(
         "- **Model ML:** `Pipeline(StandardScaler → Ridge)` (wczytywany z Spaces) — regresja czasu.\n"
         "- **Czat:** FSM + walidacja **RegEx** (deterministyczna ekstrakcja imię/płeć/wiek/czas).\n"
-        "- **Profil tempa:** parametryczny, uczony z CSV (2023/2024) przez medianę stabilności tempa w grupie."
+        "- **Profil tempa:** parametryczny, uczony z CSV (2023/2024) przez medianę stabilności tempa w grupie.\n"
+        "- **Monitoring:** **Langfuse** (śledzenie Trace/Span dla kroków FSM i walidacji)."
     )
     st.markdown("---")
     st.markdown("## 📐 Ocena jakości modelu")
@@ -501,9 +589,9 @@ with st.sidebar:
     st.markdown("---")
     if st.button("🔁 Reset", use_container_width=True):
         st.session_state["messages"].clear()
-        st.session_state["answers"]={"name":None,"gender":None,"age":None,"time_1km_str":None}
-        st.session_state["step_index"]=0
-        st.session_state["last_prediction"]=None
+        st.session_state["answers"] = {"name": None, "gender": None, "age": None, "time_1km_str": None}
+        st.session_state["step_index"] = 0
+        st.session_state["last_prediction"] = None
         st.session_state["show_balloons"] = False
         st.rerun()
 
@@ -516,8 +604,8 @@ left, right = st.columns([0.55, 0.45], vertical_alignment="top")
 with left:
     if not st.session_state["messages"]:
         st.session_state["messages"].append({
-            "role":"assistant",
-            "content":"Cześć! Zadam kilka pytań i dam prognozę półmaratonu. "+current_prompt()
+            "role": "assistant",
+            "content": "Cześć! Zadam kilka pytań i dam prognozę półmaratonu. " + current_prompt()
         })
     for idx, m in enumerate(st.session_state["messages"]):
         with st.chat_message(m["role"]):
@@ -536,33 +624,28 @@ with right:
         st.info("Wypełnij 4 kroki w czacie — po predykcji pojawią się wykresy i analiza.")
     else:
         total_sec = float(d["prediction_sec"])
-        user_group = age_to_group(int(d["wiek"])) # Ta funkcja jest już znana
+        user_group = age_to_group(int(d["wiek"]))  # Ta funkcja jest już znana
 
-        # === POCZĄTEK ZMIANY: Definicja spójnych kolorów ===
         USER_COLOR = "#FF6347"  # Jasny, pomarańczowo-czerwony (Tomato)
         REST_COLOR = "#A9A9A9"  # Ciemniejszy szary (DarkGray)
-        # === KONIEC ZMIANY ===
 
         # Wykres 1: stałe progi + Twój czas
         ref_categories = ["Twój czas", "Top 5%", "Top 15%", "Rekreacyjni", "Początkujący"]
-        ref_values = [total_sec, 90*60, 105*60, 120*60, 135*60]
-        # Mapowanie kolorów
+        ref_values = [total_sec, 90 * 60, 105 * 60, 120 * 60, 135 * 60]
         ref_colors = [USER_COLOR if cat == "Twój czas" else REST_COLOR for cat in ref_categories]
 
         ref = pd.DataFrame({
             "Kategoria": ref_categories,
             "Czas_s": ref_values
         })
-        
+
         bar1 = (
             alt.Chart(ref).mark_bar().encode(
                 x=alt.X("Kategoria:N", sort=None, title="Kategoria"),
                 y=alt.Y("Czas_s:Q", title="Czas [s]"),
                 tooltip=[alt.Tooltip("Kategoria:N"), alt.Tooltip("Czas_s:Q", format=".0f")],
-                # === ZMIANA: Zastosowanie skali kolorów ===
                 color=alt.Color("Kategoria:N", legend=None,
-                              scale=alt.Scale(domain=ref_categories, range=ref_colors))
-                # === KONIEC ZMIANY ===
+                                scale=alt.Scale(domain=ref_categories, range=ref_colors))
             ).properties(height=360)
         )
         st.altair_chart(bar1, use_container_width=True)
@@ -570,37 +653,33 @@ with right:
         # Wykres 2: 3 kolumny — Twój czas | Mediana wszystkich | Mediana grupy
         med_all = OVERALL_MEDIAN
         med_grp = float(AGE_BENCHMARKS[user_group]["median"])
-        
+
         cmp_categories = ["Twój czas", "Mediana wszystkich", f"Mediana {user_group}"]
         cmp_values = [total_sec, med_all, med_grp]
-        # Mapowanie kolorów
         cmp_colors = [USER_COLOR if cat == "Twój czas" else REST_COLOR for cat in cmp_categories]
 
         df_cmp = pd.DataFrame({
             "Pozycja": cmp_categories,
             "Czas_s": cmp_values
         })
-        
+
         bar2 = (
             alt.Chart(df_cmp).mark_bar().encode(
                 x=alt.X("Pozycja:N", sort=None, title=f"Porównanie (Twoja grupa: {user_group})"),
                 y=alt.Y("Czas_s:Q", title="Czas [s]"),
                 tooltip=[alt.Tooltip("Pozycja:N"), alt.Tooltip("Czas_s:Q", format=".0f")],
-                # === ZMIANA: Zastosowanie tej samej skali kolorów ===
                 color=alt.Color("Pozycja:N", legend=None,
-                              scale=alt.Scale(domain=cmp_categories, range=cmp_colors))
-                # === KONIEC ZMIANY ===
+                                scale=alt.Scale(domain=cmp_categories, range=cmp_colors))
             ).properties(height=360)
         )
         st.altair_chart(bar2, use_container_width=True)
 
-
         # Czasy pośrednie
         st.markdown("#### ⏱️ Czasy pośrednie")
-        # data_driven_pace_profile jest już znana
-        pace_user = data_driven_pace_profile(total_sec, user_group).rename(columns={"tempo_s_na_km":"Tempo [s/km]"})
+        pace_user = data_driven_pace_profile(total_sec, user_group).rename(
+            columns={"tempo_s_na_km": "Tempo [s/km]"})
         km_points = pace_user["km"].to_numpy()
-        tempo_k   = pace_user["Tempo [s/km]"].to_numpy()
+        tempo_k = pace_user["Tempo [s/km]"].to_numpy()
 
         def time_at(dist_km: float) -> float:
             total = 0.0
@@ -609,17 +688,17 @@ with right:
                 seg_end = km_points[i]
                 seg_len = seg_end - last
                 if dist_km >= seg_end:
-                    total += tempo_k[i]*seg_len
+                    total += tempo_k[i] * seg_len
                     last = seg_end
                 else:
-                    total += tempo_k[i]*(dist_km - last)
+                    total += tempo_k[i] * (dist_km - last)
                     break
             return total
 
-        splits = [5,10,15,20]
-        times  = [seconds_to_hhmmss(time_at(km)) for km in splits]
+        splits = [5, 10, 15, 20]
+        times = [seconds_to_hhmmss(time_at(km)) for km in splits]
         st.dataframe(
-            pd.DataFrame({"Dystans (km)":splits,"Przewidywany czas":times}),
+            pd.DataFrame({"Dystans (km)": splits, "Przewidywany czas": times}),
             use_container_width=True,
             hide_index=True
         )
@@ -635,7 +714,7 @@ with right:
             "Czas_polmaratonu_s": total_sec,
             "Czas_polmaratonu_HHMMSS": seconds_to_hhmmss(total_sec),
             "Srednie_tempo": pace_label_from_total(total_sec),
-            "Srednia_predkosc_kmh": round(speed_kmh(total_sec),2),
+            "Srednia_predkosc_kmh": round(speed_kmh(total_sec), 2),
             "Grupa_wiekowa": user_group,
             "Mediana_all_s": OVERALL_MEDIAN,
             "Mediana_grupy_s": med_grp,
@@ -649,39 +728,42 @@ with right:
             use_container_width=True
         )
 
-        # 🔍 DODANE: Wyjaśnienie od modelu OpenAI monitorowane w Langfuse
-        if LLM_READY:
-            st.markdown("#### 🧠 Wyjaśnienie od modelu GPT (monitorowane w Langfuse)")
-            with st.expander("Pokaż wyjaśnienie modelu LLM"):
-                if st.button("Poproś GPT o interpretację wyniku", use_container_width=True):
-                    explanation = explain_prediction_with_llm(
-                        result=d,
-                        group=user_group,
-                        med_all_sec=med_all,
-                        med_group_sec=med_grp,
-                    )
-                    if explanation:
-                        st.markdown(explanation)
-                    else:
-                        st.info("Brak wyjaśnienia – sprawdź konfigurację OpenAI/Langfuse w .env.")
-        else:
-            st.caption("LLM (OpenAI + Langfuse) nieaktywne – brak OPENAI_API_KEY lub problem z inicjalizacją klienta.")
-
 # =========================
 #  Chat input (fixed bottom)
 # =========================
 prompt = st.chat_input("Napisz odpowiedź…")
 if prompt:
-    st.session_state["messages"].append({"role":"user","content":prompt})
+    st.session_state["messages"].append({"role": "user", "content": prompt})
     try:
         response = chatbot_reply(prompt, memory=st.session_state["messages"][-10:])
     except Exception as e:
         response = {"content": f"Wystąpił błąd: {e}", "usage": {}}
+
+        # === LANGFUSE: Złap błąd, jeśli chatbot_reply padł ===
+        if langfuse_client:
+            # Stwórz awaryjny trace, bo ten z chatbot_reply się nie udał
+            langfuse_client.trace(CreateTrace(
+                name="FSM Chat Turn - FATAL",
+                user_id=st.session_state["answers"].get("name", "unknown_user"),
+                input=prompt,
+                output=response["content"],
+                level="ERROR",
+                status_message=str(e),
+                tags=["fsm", "marathon_calc", "fatal_error"]
+            ))
+        # === KONIEC LANGFUSE ===
+
     st.session_state["messages"].append({
-        "role":"assistant",
-        "content":response["content"],
-        "usage":response.get("usage",{})
+        "role": "assistant",
+        "content": response["content"],
+        "usage": response.get("usage", {})
     })
+
+    # === LANGFUSE: FLUSH ===
+    if langfuse_client:
+        langfuse_client.flush()
+    # === KONIEC LANGFUSE ===
+
     st.rerun()
 
 # 🎈 Balony – dokładnie wtedy, gdy wyświetliła się karta „Predykcja i skala”
@@ -698,8 +780,6 @@ st.markdown(f"""
 .block-container {{ padding-bottom: {BOTTOM_BAR_HEIGHT + 16}px !important; }}
 
 /* Chat input na stałe na dole */
-/* UWAGA (Senior): Poleganie na [data-testid] jest ryzykowne, */
-/* może ulec zmianie w nowszych wersjach Streamlit. */
 div[data-testid="stChatInput"] {{
   position: fixed !important; bottom: 0; z-index: 1000;
   left: var(--chat-left, 340px); right: var(--chat-right, 24px);
@@ -733,7 +813,6 @@ components.html("""
 <script>
 (function () {
   function setChatWidth() {
-    /* UWAGA (Senior): Poleganie na [data-testid] jest ryzykowne. */
     const sb = parent.document.querySelector('[data-testid="stSidebar"]');
     const root = parent.document.documentElement;
     const sidebarWidth = sb ? sb.offsetWidth : 0;
