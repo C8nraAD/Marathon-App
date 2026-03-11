@@ -6,8 +6,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
-import boto3
 import joblib
+from azure.storage.blob import BlobServiceClient
 from dotenv import load_dotenv
 
 try:
@@ -32,16 +32,16 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 load_dotenv()
-AWS_KEY = os.getenv("AWS_ACCESS_KEY_ID", "").strip()
-AWS_SECRET = os.getenv("AWS_SECRET_ACCESS_KEY", "").strip()
-AWS_URL = os.getenv("AWS_ENDPOINT_URL_S3", "").strip()
-BUCKET = os.getenv("DO_SPACE_NAME", "").strip()
-MODEL_KEY = os.getenv("MODEL_S3_KEY", "").strip()
+
+AZURE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "").strip()
+CONTAINER_NAME = os.getenv("AZURE_CONTAINER_NAME", "").strip()
+MODEL_KEY = os.getenv("MODEL_BLOB_KEY", "").strip()
+FILE_2023 = os.getenv("BLOB_FILE_2023", "").strip()
+FILE_2024 = os.getenv("BLOB_FILE_2024", "").strip()
 OPENAI_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
 if OPENAI_KEY:
     os.environ["OPENAI_API_KEY"] = OPENAI_KEY
-
 
 def format_time(sec: float) -> str:
     if pd.isna(sec) or sec <= 0: return "0:00"
@@ -57,33 +57,62 @@ def get_age_group(age: int) -> str:
     if age < 60: return "50-59"
     return "60+"
 
+# Azure Blob Storage client with caching and error handling
 @st.cache_resource
-def get_s3():
-    return boto3.client("s3", endpoint_url=AWS_URL, aws_access_key_id=AWS_KEY, aws_secret_access_key=AWS_SECRET)
+def get_azure_container_client():
+    if not AZURE_CONNECTION_STRING or not CONTAINER_NAME:
+        logging.warning("Brak kluczy Azure. Uruchamianie w trybie offline/fallback.")
+        return None
+    blob_service_client = BlobServiceClient.from_connection_string(AZURE_CONNECTION_STRING)
+    return blob_service_client.get_container_client(CONTAINER_NAME)
 
 @st.cache_data
 def load_benchmarks():
-    s3 = get_s3()
-    def _fetch(key):
-        obj = s3.get_object(Bucket=BUCKET, Key=key)
-        return pd.read_csv(io.BytesIO(obj["Body"].read()), usecols=["Age", "Time_Seconds"])
+    container_client = get_azure_container_client()
+    if not container_client:
+        return {}, MEDIANA_DEFAULT
+        
+    def _fetch(blob_name):
+        if not blob_name: return pd.DataFrame()
+        try:
+            blob_client = container_client.get_blob_client(blob_name)
+            stream = blob_client.download_blob().readall()
+            return pd.read_csv(io.BytesIO(stream), usecols=["Age", "Time_Seconds"])
+        except Exception as e:
+            logging.error(f"Błąd pobierania pliku {blob_name} z Azure: {e}")
+            return pd.DataFrame()
+
     try:
-        df = pd.concat([_fetch(os.getenv("S3_FILE_2023", "")), _fetch(os.getenv("S3_FILE_2024", ""))], ignore_index=True)
+        df_2023 = _fetch(FILE_2023)
+        df_2024 = _fetch(FILE_2024)
+        df = pd.concat([df_2023, df_2024], ignore_index=True)
+        
+        if df.empty:
+            return {}, MEDIANA_DEFAULT
+            
         df = df[(df["Age"].between(15, 90)) & df["Time_Seconds"].notna()].copy()
         df["Group"] = df["Age"].apply(get_age_group)
         bench = {g: float(grp["Time_Seconds"].median()) for g, grp in df.groupby("Group")}
         return bench, float(df["Time_Seconds"].median())
-    except: return {}, MEDIANA_DEFAULT
+    except Exception as e: 
+        logging.error(f"Krytyczny błąd przetwarzania benchmarków: {e}")
+        return {}, MEDIANA_DEFAULT
 
 BENCH_DATA, OVERALL_MEDIAN = load_benchmarks()
 
 @st.cache_resource
 def load_model():
     if not MODEL_KEY: return None
+    container_client = get_azure_container_client()
+    if not container_client: return None
+    
     try:
-        obj = get_s3().get_object(Bucket=BUCKET, Key=MODEL_KEY)
-        return joblib.load(io.BytesIO(obj["Body"].read()))
-    except: return None
+        blob_client = container_client.get_blob_client(MODEL_KEY)
+        stream = blob_client.download_blob().readall()
+        return joblib.load(io.BytesIO(stream))
+    except Exception as e: 
+        logging.error(f"Błąd ładowania modelu ML z Azure: {e}")
+        return None
 
 model_ml = load_model()
 client_llm = LfOpenAI() if (OPENAI_KEY and LfOpenAI) else None
@@ -93,7 +122,7 @@ with st.sidebar:
     st.write("Estimates half-marathon finish times based on a short chat input. It uses basic user data to generate a pacing profile compared against 18k+ runners.")
     
     st.header("🛠️ Technology")
-    st.markdown("- **Model:** `StandardScaler` → `Ridge Regression` \n- **Data:** Aggregated CSV on `S3` \n- **Engine:** `Riegel's Law` optimization")
+    st.markdown("- **Model:** `StandardScaler` → `Ridge Regression` \n- **Data:** Aggregated CSV on `Azure Blob Storage` \n- **Engine:** `Riegel's Law` optimization")
     
     st.header("📈 Performance")
     st.markdown("- **R² Score:** `0.98` \n- **MAE:** `~54 seconds` \n- **Sample:** `18,377 runners`")
@@ -114,7 +143,6 @@ if "step" not in st.session_state: st.session_state["step"] = 0
 if "pred" not in st.session_state: st.session_state["pred"] = None
 if "show_balloons" not in st.session_state: st.session_state["show_balloons"] = False
 
-# --- POPRAWIONA MASZYNA STANÓW (BUG FIX) ---
 def chat_flow(txt):
     if txt.lower() in ("reset", "restart"):
         st.session_state.clear()
@@ -170,7 +198,6 @@ col_l, col_r = st.columns([0.5, 0.5])
 
 with col_l:
     st.subheader("💬 Assistant")
-    # Wyświetlanie historii
     if not st.session_state.messages:
         with st.chat_message("assistant"):
             st.write("Hi! Let's estimate your half-marathon time. What is your name?")
@@ -193,7 +220,6 @@ with col_r:
             "Seconds": [p["sec"], m_grp, OVERALL_MEDIAN]
         })
         
-        # Wykres z wyraźną legendą i kolorami
         chart = alt.Chart(df_plot).mark_bar(cornerRadiusTopLeft=10).encode(
             x=alt.X("Category", sort=None, title=None),
             y=alt.Y("Seconds", title="Time (s)"),
