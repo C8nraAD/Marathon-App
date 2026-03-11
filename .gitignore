@@ -1,3 +1,5 @@
 .env
-.pkl
-.vscode
+__pycache__
+*.pkl
+marathon_*.csv
+.git
