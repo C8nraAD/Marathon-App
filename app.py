@@ -10,6 +10,8 @@ import joblib
 from azure.storage.blob import BlobServiceClient
 from dotenv import load_dotenv
 
+load_dotenv()
+
 try:
     from langfuse.openai import OpenAI as LfOpenAI
 except ImportError:
@@ -31,7 +33,6 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-load_dotenv()
 
 AZURE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "").strip()
 CONTAINER_NAME = os.getenv("AZURE_CONTAINER_NAME", "").strip()
